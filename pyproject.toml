@@ -1,0 +1,8 @@
+[tool.bandit]
+# Тесты сканировать не нужно: assert в тестах — это норма (B101), # а тестовые пароли — не утечка.
+exclude_dirs = ["tests", ".venv", "venv", ".git"]
+
+[tool.pytest.ini_options]
+# Чтобы "from app import app" работал при любом способе запуска pytest.
+pythonpath = ["."]
+testpaths = ["tests"]
