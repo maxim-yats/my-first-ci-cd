@@ -1,0 +1,159 @@
+name: CI/CD Pipeline with SAST & SCA
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Наименьшие привилегии: по умолчанию токену нужно только читать код.
+permissions:
+  contents: read
+
+# Отменяем предыдущий запуск, если пришел новый коммит в ту же ветку.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # --------- Быстрая проверка стиля: идет первой (fail fast) ---------
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install flake8
+        run: pip install flake8
+
+      # Первый прогон блокирующий: только синтаксические ошибки.
+      - name: Critical errors (blocking)
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      # Второй — информационный: стилевые замечания не должны валить сборку.
+      - name: Style report (non-blocking)
+        run: flake8 . --count --statistics --exit-zero
+
+  # --------- Проверки безопасности ---------
+  security-scan:
+    name: Security Scan (SAST + SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "bandit[toml]"
+
+      # --- SAST ---
+      # Читаемый вывод в лог. --exit-zero: решение о падении принимаем ниже,
+      # на основе явной политики, а не кода возврата инструмента.
+      - name: Run Bandit (human-readable)
+        run: bandit -c pyproject.toml -r . -f screen --exit-zero
+
+      - name: Run Bandit (JSON report)
+        run: bandit -c pyproject.toml -r . -f json -o bandit-results.json --exit-zero
+
+      # if: always() — критично. Без него отчет не сохранится при падении
+      # следующих шагов, то есть ровно тогда, когда он нужнее всего.
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: bandit-report
+          path: bandit-results.json
+          retention-days: 14
+
+      # Quality Gate: фильтруем ТОЛЬКО по severity.
+      # Фильтр по confidence здесь был бы ошибкой — он скрыл бы B201.
+      - name: Quality Gate — fail on HIGH severity
+        run: |
+          COUNT=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-results.json)
+          echo "Находок с severity=HIGH: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::Bandit нашел $COUNT проблем(ы) уровня HIGH"
+            jq -r '.results[]
+              | select(.issue_severity == "HIGH")
+              | "\(.filename):\(.line_number) [\(.test_id)] sev=\(.issue_severity) conf=\(.issue_confidence) —
+          \(.issue_text)"' \
+              bandit-results.json
+            exit 1
+          fi
+          echo "Проблем уровня HIGH не найдено."
+
+      # --- SCA ---
+      # ВНИМАНИЕ: @master запрещен. Возьмите актуальный тег или SHA релиза
+      # со страницы https://github.com/aquasecurity/trivy-action/releases
+      # и подставьте его вместо <ВЕРСИЯ>.
+      - name: Run Trivy (dependency scan)
+        uses: aquasecurity/trivy-action@<ВЕРСИЯ>
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # --------- Тесты ---------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run pytest
+        run: pytest -v
+
+  # --------- Сборка: только если все зеленое ---------
+  build:
+    name: Build Artifact
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan, test]  # <- ключевое слово задания №3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Create build artifact
+        run: |
+          mkdir -p dist
+          tar --exclude=./dist --exclude=./.git -czf dist/app.tar.gz .
+          echo "Собрано: $(du -h dist/app.tar.gz | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: application-build
+          path: dist/app.tar.gz
